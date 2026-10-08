@@ -39,6 +39,52 @@ class Course:
 
     def remove_student(self, student_name):
         self.students.remove(student_name)
+=======
+#!/usr/bin/env python3
+"""TEL354 Lab 4: administrador proactivo de políticas SDN con Floodlight 1.2.
+Ejecutar en la VM Controller junto a database.yaml.
+"""
+import asyncio
+import ipaddress
+import json
+import re
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import aiohttp
+import requests
+import yaml
+
+BASE_URL = 'http://127.0.0.1:8080'
+STATIC_URL = BASE_URL + '/wm/staticflowpusher/json'
+TIMEOUT = 8
+
+@dataclass
+class Student:
+    name: str
+    mac: str
+
+@dataclass
+class Service:
+    name: str
+    protocol: str
+    port: int
+
+@dataclass
+class Server:
+    name: str
+    ip: str
+    services: dict = field(default_factory=dict)
+
+@dataclass
+class Course:
+    name: str
+    code: str
+    state: str
+    students: list
+    servers: list
+>>>>>>> c13720a (Correccion de rutas y flows OpenFlow - Lab 4)
 
 students_db = []
 servers_db = []
@@ -46,6 +92,7 @@ courses_db = []
 connections_db = {}
 
 
+<<<<<<< HEAD
 def load_data(filename):
     with open(filename, "r") as file:
         data = yaml.safe_load(file)
@@ -287,4 +334,296 @@ def main():
             print("Invalido")
 
 if __name__ == "__main__":
+=======
+def load_data(path='database.yaml'):
+    data = yaml.safe_load(Path(path).read_text(encoding='utf-8'))
+    students = [Student(s['name'], s['mac'].lower()) for s in data.get('students', [])]
+    servers = [Server(s['name'], str(s['ip']), {
+        v['name']: Service(v['name'], str(v['protocol']).lower(), int(v['port']))
+        for v in s.get('services', [])}) for s in data.get('servers', [])]
+    courses = [Course(c['name'], c.get('code', ''), c['state'],
+                      list(c.get('students', [])), list(c.get('servers', [])))
+               for c in data.get('courses', [])]
+    return students, servers, courses
+
+
+def api_get(path, params=None):
+    r = requests.get(BASE_URL + path, params=params, timeout=TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def devices():
+    result = api_get('/wm/device/')
+    return result if isinstance(result, list) else result.get('devices', [])
+
+
+def device_for_mac(mac):
+    for d in devices():
+        if mac.lower() in [str(x).lower() for x in d.get('mac', [])]:
+            return d
+    return None
+
+
+def device_for_ip(ip):
+    for d in devices():
+        if ip in [str(x) for x in d.get('ipv4', [])]:
+            return d
+    return None
+
+
+def attachment(device):
+    if not device:
+        raise RuntimeError('Dispositivo no descubierto por Floodlight')
+    points = [p for p in device.get('attachmentPoint', []) if p.get('switchDPID') and p.get('port') is not None]
+    if not points:
+        raise RuntimeError('El dispositivo no tiene attachmentPoint conocido')
+    p = points[0]
+    return str(p['switchDPID']), int(p['port'])
+
+
+def calculate_route(src_mac, dst_ip):
+    src = device_for_mac(src_mac)
+    dst = device_for_ip(dst_ip)
+    if not src or not dst:
+        raise RuntimeError('Floodlight no conoce la MAC del alumno o la IP del servidor. Verifica hosts, ARP y topología.')
+    src_sw, src_port = attachment(src)
+    dst_sw, dst_port = attachment(dst)
+    dst_macs = dst.get('mac', [])
+    if not dst_macs:
+        raise RuntimeError('Floodlight no conoce la MAC del servidor')
+    dst_mac = str(dst_macs[0]).lower()
+    if src_sw == dst_sw:
+        hops = [(src_sw, src_port, dst_port)]
+    else:
+        path = api_get(f'/wm/topology/route/{src_sw}/{src_port}/{dst_sw}/{dst_port}/json')
+        if isinstance(path, dict):
+            path = path.get('route', path.get('path', []))
+        if not isinstance(path, list) or len(path) < 2 or len(path) % 2:
+            raise RuntimeError(f'Ruta inválida/no disponible: {path}')
+        hops = []
+        for i in range(0, len(path), 2):
+            entry, exit_ = path[i], path[i + 1]
+            sw = entry.get('switch') or entry.get('switchDPID')
+            sw2 = exit_.get('switch') or exit_.get('switchDPID')
+            if sw != sw2:
+                raise RuntimeError('Ruta inconsistente: dos extremos del salto pertenecen a switches distintos')
+            hops.append((str(sw), int(entry['port']['portNumber']), int(exit_['port']['portNumber'])))
+    return hops, dst_mac
+
+
+def authorized(student, server, service):
+    return any(c.state.upper() == 'ACTIVE' and student.name in c.students and
+               any(s.get('name') == server.name and service in s.get('allowed_services', [])
+                   for s in c.servers) for c in courses_db)
+
+
+def flow(switch, name, match, out_port):
+    return {'switch': switch, 'name': name, 'cookie': '0', 'priority': '200',
+            'active': 'true', **match, 'actions': f'output={out_port}'}
+
+
+def build_route(hops, student_mac, server_mac, server_ip, service, handler):
+    """Construye reglas en ambos sentidos para cada salto y ARP bidireccional."""
+    proto = '6' if service.protocol == 'tcp' else '17' if service.protocol == 'udp' else None
+    if proto is None:
+        raise ValueError('Solo se admiten servicios TCP/UDP')
+    flows = []
+    for idx, (sw, incoming, outgoing) in enumerate(hops):
+        common = f'{handler}-{idx}'
+        flows.append(flow(sw, f'{common}-fwd', {
+            'in_port': str(incoming), 'eth_type': '0x0800', 'eth_src': student_mac,
+            'eth_dst': server_mac, 'ipv4_dst': server_ip, 'ip_proto': proto,
+            'tp_dst': str(service.port)}, outgoing))
+        flows.append(flow(sw, f'{common}-rev', {
+            'in_port': str(outgoing), 'eth_type': '0x0800', 'eth_src': server_mac,
+            'eth_dst': student_mac, 'ip_proto': proto, 'tp_src': str(service.port)}, incoming))
+        flows.append(flow(sw, f'{common}-arp-fwd', {
+            'in_port': str(incoming), 'eth_type': '0x0806', 'eth_src': student_mac}, outgoing))
+        flows.append(flow(sw, f'{common}-arp-rev', {
+            'in_port': str(outgoing), 'eth_type': '0x0806', 'eth_src': server_mac}, incoming))
+    return flows
+
+
+async def push_flows(flows):
+    timeout = aiohttp.ClientTimeout(total=TIMEOUT)
+    installed = []
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for f in flows:
+            async with session.post(STATIC_URL, json=f) as response:
+                body = await response.text()
+                if response.status >= 400 or ('error' in body.lower() and 'no error' not in body.lower()):
+                    raise RuntimeError(f'Falló flow {f["name"]}: HTTP {response.status}: {body}')
+                installed.append(f['name'])
+    return installed
+
+
+def delete_flows(names):
+    errors = []
+    for name in names:
+        try:
+            r = requests.delete(STATIC_URL, json={'name': name}, timeout=TIMEOUT)
+            r.raise_for_status()
+            if 'error' in r.text.lower() and 'no error' not in r.text.lower():
+                raise RuntimeError(r.text)
+        except Exception as e:
+            errors.append(f'{name}: {e}')
+    return errors
+
+
+def pick(items, name):
+    return next((x for x in items if x.name.lower() == name.strip().lower()), None)
+
+
+def menu_courses():
+    print('\n--- CURSOS ---\n1) Listar\n2) Mostrar detalles\n3) Gestionar alumnos')
+    choice = input('>>> ').strip()
+    if choice == '1':
+        for c in courses_db:
+            print(f'{c.code} | {c.name} | {c.state}')
+    elif choice == '2':
+        c = pick(courses_db, input('Nombre del curso: '))
+        if c:
+            print(f'Código: {c.code}\nEstado: {c.state}\nAlumnos: {", ".join(c.students)}')
+            for s in c.servers:
+                print(f'Servidor: {s["name"]}; servicios permitidos: {", ".join(s.get("allowed_services", []))}')
+        else:
+            print('Curso no encontrado')
+    elif choice == '3':
+        c = pick(courses_db, input('Nombre del curso: '))
+        if not c:
+            print('Curso no encontrado'); return
+        op = input('1) Agregar  2) Quitar: ').strip()
+        student = pick(students_db, input('Nombre del alumno: '))
+        if not student:
+            print('El alumno debe estar registrado'); return
+        if op == '1':
+            if student.name not in c.students:
+                c.students.append(student.name)
+            print('Alumno agregado')
+        elif op == '2':
+            if student.name in c.students:
+                c.students.remove(student.name)
+                print('Alumno retirado')
+            else:
+                print('No estaba matriculado')
+
+
+def menu_students():
+    print('\n--- ALUMNOS ---\n1) Crear\n2) Listar\n3) Mostrar detalles')
+    op = input('>>> ').strip()
+    if op == '1':
+        name = input('Nombre: ').strip()
+        mac = input('MAC: ').strip().lower()
+        if not name or not re.fullmatch(r'(?:[0-9a-f]{2}:){5}[0-9a-f]{2}', mac):
+            print('Nombre o MAC inválidos'); return
+        if pick(students_db, name):
+            print('Alumno ya registrado'); return
+        students_db.append(Student(name, mac))
+        print('Alumno registrado')
+    elif op == '2':
+        for s in students_db:
+            print(f'{s.name} | MAC: {s.mac}')
+    elif op == '3':
+        s = pick(students_db, input('Nombre: '))
+        print(f'{s.name} | MAC: {s.mac}' if s else 'Alumno no encontrado')
+
+
+def menu_servers():
+    print('\n--- SERVIDORES ---\n1) Listar\n2) Mostrar servicios')
+    op = input('>>> ').strip()
+    if op == '1':
+        for s in servers_db:
+            print(f'{s.name} | IP: {s.ip}')
+    elif op == '2':
+        s = pick(servers_db, input('Servidor: '))
+        if s:
+            print(f'{s.name} | IP: {s.ip}')
+            for v in s.services.values():
+                print(f'{v.name}: {v.protocol.upper()} / {v.port}')
+        else:
+            print('Servidor no encontrado')
+
+
+def create_connection():
+    student = pick(students_db, input('Nombre del alumno: '))
+    server = pick(servers_db, input('Nombre del servidor: '))
+    service_name = input('Servicio (ssh/web/dev): ').strip().lower()
+    if not student or not server or service_name not in server.services:
+        print('Alumno, servidor o servicio inexistente'); return
+    if not authorized(student, server, service_name):
+        print('ERROR: alumno no autorizado para ese servicio'); return
+    handler = 'h_' + uuid.uuid4().hex[:10]
+    flows = []
+    try:
+        hops, server_mac = calculate_route(student.mac, server.ip)
+        flows = build_route(hops, student.mac, server_mac, server.ip,
+                            server.services[service_name], handler)
+        asyncio.run(push_flows(flows))
+    except Exception as e:
+        if flows:
+            delete_flows([f['name'] for f in flows])
+        print(f'ERROR: no se pudo instalar la ruta: {e}')
+        return
+    connections_db[handler] = {'student': student.name, 'server': server.name,
+                               'service': service_name, 'hops': hops,
+                               'flows': [f['name'] for f in flows]}
+    print(f'Conexión creada: {handler}; {len(flows)} reglas enviadas')
+    print('Verifica su instalación real con ovs-ofctl dump-flows en cada switch.')
+
+
+def menu_connections():
+    print('\n--- CONEXIONES ---\n1) Crear\n2) Listar\n3) Mostrar ruta\n4) Borrar')
+    op = input('>>> ').strip()
+    if op == '1':
+        create_connection()
+    elif op == '2':
+        for h, d in connections_db.items():
+            print(f'{h}: {d["student"]} -> {d["server"]} ({d["service"]})')
+    elif op == '3':
+        h = input('Handler: ').strip()
+        d = connections_db.get(h)
+        print(json.dumps(d, indent=2) if d else 'Handler no encontrado')
+    elif op == '4':
+        h = input('Handler: ').strip()
+        d = connections_db.get(h)
+        if not d:
+            print('Handler no encontrado'); return
+        student = pick(students_db, d['student'])
+        server = pick(servers_db, d['server'])
+        if not student or not server or not authorized(student, server, d['service']):
+            print('ERROR: alumno no autorizado actualmente; eliminación denegada por la política del laboratorio')
+            return
+        errors = delete_flows(d['flows'])
+        if errors:
+            print('Errores al eliminar:\n' + '\n'.join(errors)); return
+        del connections_db[h]
+        print('Conexión eliminada; comprueba los flows en OvS')
+
+
+def main():
+    global students_db, servers_db, courses_db
+    try:
+        students_db, servers_db, courses_db = load_data()
+    except Exception as e:
+        print(f'Error leyendo database.yaml: {e}')
+        return
+    while True:
+        print('\n=== Network Policy Manager TEL354 ===')
+        print('1) Importar\n2) Exportar\n3) Cursos\n4) Alumnos\n5) Servidores\n6) Políticas\n7) Conexiones\n8) Salir')
+        op = input('>>> ').strip()
+        if op == '3': menu_courses()
+        elif op == '4': menu_students()
+        elif op == '5': menu_servers()
+        elif op == '7': menu_connections()
+        elif op == '8': break
+        elif op in ('1', '2', '6'):
+            print('Opción no implementada: la guía no la marca con (*)')
+        else:
+            print('Opción inválida')
+
+
+if __name__ == '__main__':
+>>>>>>> c13720a (Correcion - Lab 4)
     main()
+
